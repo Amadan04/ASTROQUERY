@@ -1,0 +1,1159 @@
+# --- Standard library ---
+import asyncio
+import json
+import re
+import os
+from collections import defaultdict
+from datetime import datetime
+
+# --- Third-party libraries ---
+import pandas as pd
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from sqlalchemy.orm import Session
+
+# --- Local modules ---
+from config import Config
+from db import SessionLocal
+from ingest.scrape_pmc_xml import crawl_and_store
+from models import (
+    init_db,
+    Publication,
+    Section,
+    SectionType,
+    Entity,
+    Triple,
+    Lesson,  # for education tab
+)
+from process.ai_pipeline import summarize_paper, chat_with_context, extract_entities_triples
+from process.education_pipeline import (
+    generate_lessons_for_all_topics,
+    generate_questions_for_lessons,
+)
+from trends import compute_entity_trends, compute_relation_trends, compute_top_trends
+from utils.text_clean import safe_truncate
+from utils.nlp_clean import (
+    normalize_entity,
+    normalize_relation,
+    is_valid_entity,
+    is_valid_relation,
+    normalize_confidence,
+)
+from vector_engine import VectorEngine
+from process.deep_research import analyze_research_paper
+
+
+# -------------------------------------------------------------------
+# App Initialization
+# -------------------------------------------------------------------
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+init_db()
+load_dotenv()
+
+VE = VectorEngine(persist=True)
+VE.model.encode(["warmup"], convert_to_numpy=True)
+app.logger.info("✅ VectorEngine ready")
+
+# -------------------------------------------------------------------
+# Utility / Maintenance Routes
+# -------------------------------------------------------------------
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    app.logger.info("Health check requested")
+    return jsonify({"status": "ok"})
+
+
+@app.route("/reset-db", methods=["POST"])
+def reset_db():
+    app.logger.warning(
+        "⚠️ Full reset: clearing Publications, Sections, Entities, Triples and FAISS index"
+    )
+    db = SessionLocal()
+    try:
+        # Delete in order (children first)
+        db.query(Entity).delete()
+        db.query(Triple).delete()
+        db.query(Section).delete()
+        db.query(Publication).delete()
+        db.commit()
+
+        # Reset FAISS index files
+        for path in [
+            Config.FAISS_INDEX_PATH,
+            Config.EMBEDDINGS_NPY_PATH,
+            Config.ID_MAP_NPY_PATH,
+        ]:
+            if os.path.exists(path):
+                os.remove(path)
+
+        # Reset global VectorEngine (re-initialized lazily)
+        global VE
+        VE = None
+
+        app.logger.info("✅ Database and FAISS index fully reset")
+        return jsonify({"status": "reset all ok"})
+    finally:
+        db.close()
+
+
+@app.route("/stats", methods=["GET"])
+def stats():
+    app.logger.info("📊 Stats endpoint requested")
+    db: Session = SessionLocal()
+    try:
+        total = db.query(Publication).count()
+        restricted = db.query(Publication).filter(
+            Publication.xml_restricted == True).count()
+        full_text = total - restricted
+
+        journals = [
+            j[0]
+            for j in db.query(Publication.journal)
+            .filter(Publication.journal.isnot(None))
+            .distinct()
+            .order_by(Publication.journal)
+            .all()
+        ]
+
+        min_year = (
+            db.query(Publication.year)
+            .filter(Publication.year.isnot(None))
+            .order_by(Publication.year.asc())
+            .first()
+        )
+        max_year = (
+            db.query(Publication.year)
+            .filter(Publication.year.isnot(None))
+            .order_by(Publication.year.desc())
+            .first()
+        )
+
+        # fmt: off
+        app.logger.info(f"✅ Stats computed: {total} publications, {restricted} restricted")
+        return jsonify(
+            {
+                "total": total,
+                "restricted": restricted,
+                "full_text": full_text,
+                "journals": journals,
+                "year_range": {
+                    "min": min_year[0] if min_year else None,
+                    "max": max_year[0] if max_year else None,
+                },
+            }
+        )
+    finally:
+        db.close()
+
+
+# -------------------------------------------------------------------
+# Data Ingestion & Browsing
+# -------------------------------------------------------------------
+
+
+@app.route("/ingest/from-csv", methods=["POST"])
+def ingest_from_csv():
+    payload = request.get_json(force=True) or {}
+    csv_path = payload.get("csv_path", "data/SB_publication_PMC.csv")
+    limit = int(payload.get("limit", 0))
+    app.logger.info(f"📥 Ingest request from CSV={csv_path}, limit={limit}")
+
+    df = pd.read_csv(csv_path)
+    urls = df["Link"].dropna().tolist()
+    if limit > 0:
+        urls = urls[:limit]
+
+    res = asyncio.run(crawl_and_store(urls))
+    app.logger.info(f"✅ Ingest completed: {len(res)} URLs processed")
+
+    return jsonify({"ingest": res, "index_built": True})
+
+
+@app.route("/publications", methods=["GET"])
+def list_publications():
+    app.logger.info("Listing publications with filters")
+    page = int(request.args.get("page", 1))
+    per_page = min(int(request.args.get("per_page", 20)), 100)
+
+    db: Session = SessionLocal()
+    try:
+        q = db.query(Publication)
+
+        journal = request.args.get("journal")
+        if journal:
+            q = q.filter(Publication.journal.ilike(f"%{journal}%"))
+
+        year_from = request.args.get("year_from", type=int)
+        if year_from:
+            q = q.filter(Publication.year >= year_from)
+
+        year_to = request.args.get("year_to", type=int)
+        if year_to:
+            q = q.filter(Publication.year <= year_to)
+
+        restricted = request.args.get("restricted")
+        if restricted is not None:
+            restricted_flag = restricted.lower() in ("1", "true", "yes")
+            q = q.filter(Publication.xml_restricted == restricted_flag)
+
+        total = q.count()
+        rows = q.offset((page - 1) * per_page).limit(per_page).all()
+
+        items = [
+            {
+                "id": p.id,
+                "pmc_id": p.pmc_id,
+                "title": p.title,
+                "link": p.link,
+                "journal": p.journal,
+                "year": p.year,
+                "xml_restricted": p.xml_restricted,
+            }
+            for p in rows
+        ]
+
+        # fmt: off
+        app.logger.info(
+            f"✅ Returned {len(items)} publications (page {page}/{(total + per_page - 1) // per_page})"
+        )
+        return jsonify(
+            {
+                "items": items,
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "pages": (total + per_page - 1) // per_page,
+            }
+        )
+    finally:
+        db.close()
+
+
+@app.route("/papers/<int:pub_id>", methods=["GET"])
+def get_paper(pub_id: int):
+    app.logger.info(f"Fetching paper {pub_id}")
+    db: Session = SessionLocal()
+    try:
+        p = db.get(Publication, pub_id)
+        if not p:
+            app.logger.warning(f"❌ Paper {pub_id} not found")
+            return jsonify({"error": "not found"}), 404
+        secs = db.query(Section).filter(Section.publication_id == p.id).all()
+
+        app.logger.info(f"✅ Paper {pub_id} fetched successfully")
+        return jsonify(
+            {
+                "id": p.id,
+                "pmc_id": p.pmc_id,
+                "title": p.title,
+                "link": p.link,
+                "journal": p.journal,
+                "year": p.year,
+                "xml_restricted": p.xml_restricted,
+                "sections": [
+                    {"id": s.id, "kind": s.kind.value,
+                        "text": safe_truncate(s.text, 8000)}
+                    for s in secs
+                ],
+            }
+        )
+    finally:
+        db.close()
+
+
+# -------------------------------------------------------------------
+# Core Features: Search & Chat
+# -------------------------------------------------------------------
+
+
+@app.route("/semantic-search", methods=["GET"])
+def semantic_search():
+    q = request.args.get("q", "").strip()
+    app.logger.info(f"🔎 Semantic search query='{q}'")
+    k = int(request.args.get("k", "10"))
+    section = (request.args.get("section", "") or "").strip().lower() or None
+
+    year_from = request.args.get("year_from", type=int)
+    year_to = request.args.get("year_to", type=int)
+    journal = request.args.get("journal")
+    restricted = request.args.get("restricted")
+    with_suggestions = request.args.get(
+        "suggestions", "false").lower() in ("1", "true", "yes")
+
+    if not q:
+        app.logger.warning("❌ Missing query in semantic search")
+        return jsonify({"error": "missing query"}), 400
+
+    global VE
+    if VE is None:
+        VE = VectorEngine(persist=True)
+
+    matches = VE.search(
+        query=q,
+        top_k=k,
+        section=section,
+        year_from=year_from,
+        year_to=year_to,
+        journal=journal,
+        restricted=(restricted.lower() in ("1", "true", "yes")
+                    ) if restricted is not None else None,
+    )
+
+    fallback_used = False
+    if section and not matches:
+        fallback_used = True
+        matches = VE.search(q, top_k=k, section=None)
+
+    db: Session = SessionLocal()
+    try:
+        grouped = defaultdict(
+            lambda: {
+                "sections": [],
+                "best_dist": float("inf"),
+                "title": None,
+                "journal": None,
+                "year": None,
+                "link": None,
+            }
+        )
+
+        for pub_id, kind, dist in matches:
+            p = db.get(Publication, pub_id)
+            if not p:
+                continue
+
+            g = grouped[p.id]
+            g["title"] = p.title
+            g["journal"] = p.journal
+            g["year"] = p.year
+            g["link"] = p.link
+            g["sections"].append(kind)
+            if dist < g["best_dist"]:
+                g["best_dist"] = dist
+
+        results = [
+            {
+                "id": pub_id,
+                "title": g["title"],
+                "journal": g["journal"],
+                "year": g["year"],
+                "link": g["link"],
+                "sections": sorted(set(g["sections"])),
+                "distance": g["best_dist"],
+            }
+            for pub_id, g in grouped.items()
+        ]
+
+        response = {"results": results}
+        if fallback_used:
+            response["warning"] = f"No matches found in section '{section}', fell back to global search."
+
+        if with_suggestions:
+            sys_prompt = (
+                "You are an expert scientific search assistant. "
+                "Rewrite the user's query into 3-5 alternative search queries "
+                "that are database-friendly and likely to return more relevant results. "
+                "Return only the queries as a JSON array."
+            )
+            conv_msgs = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": q},
+            ]
+            raw = chat_with_context(conv_msgs)
+            try:
+                clean = re.sub(r"^```(?:json)?|```$", "",
+                               raw.strip(), flags=re.MULTILINE).strip()
+                suggestions = json.loads(clean)
+                if not isinstance(suggestions, list):
+                    raise ValueError("Not a list")
+            except Exception:
+                suggestions = [line.strip("-• \n")
+                               for line in raw.splitlines() if line.strip()]
+                suggestions = [s for s in suggestions if len(s) > 2][:5]
+
+            response["suggestions"] = suggestions
+            app.logger.info(f"💡 Added {len(suggestions)} AI query suggestions")
+
+        # fmt: off
+        app.logger.info(f"✅ Semantic search returned {len(results)} results (fallback={fallback_used})")
+        return jsonify(response)
+    finally:
+        db.close()
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json(force=True) or {}
+    messages = data.get("messages", [])
+    only_context = data.get("only_context", False)
+    k = int(data.get("k", 5))
+
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    query = user_msgs[-1]["content"] if user_msgs else ""
+    app.logger.info(f"💬 Chat request query='{query[:50]}...'")
+
+    global VE
+    if VE is None:
+        VE = VectorEngine(persist=True)
+
+    results = VE.search(query, top_k=k)
+
+    if not results:
+        app.logger.warning("❌ No relevant docs found for chat")
+        return jsonify(
+            {"answer": "No relevant documents found.",
+                "mode": "none", "citations": [], "chunks_used": 0}
+        )
+
+    db: Session = SessionLocal()
+    docs, citations = [], []
+    try:
+        for pub_id, kind, dist in results:
+            sec = db.query(Section).filter(
+                Section.publication_id == pub_id, Section.kind == kind).first()
+            pub = db.get(Publication, pub_id)
+            if sec and pub:
+                docs.append(f"Section: {kind}\n{safe_truncate(sec.text, 1500)}")
+                citations.append(
+                    {"id": pub.id, "title": pub.title, "link": pub.link,
+                        "journal": pub.journal, "year": pub.year}
+                )
+    finally:
+        db.close()
+
+    ctx = "\n\n".join(docs)
+    enough_text = len(ctx) > 50
+    relevant = len(docs) > 0
+
+    if only_context or (relevant and enough_text):
+        sys_prompt = (
+            "You are a space biology expert. Answer ONLY using the provided context. "
+            "If the answer isn't there, say 'I don't know.' Keep it concise."
+        )
+        user_prompt = f"Context:\n{ctx}\n\nQuestion: {query}"
+        mode = "RAG"
+    else:
+        sys_prompt = "You are a helpful science assistant. Use general knowledge. If uncertain, say you're unsure."
+        user_prompt = query
+        mode = "AI"
+
+    history = messages[-6:]
+    conv_msgs = [{"role": "system", "content": sys_prompt}] + \
+        history[:-1] + [{"role": "user", "content": user_prompt}]
+    answer = chat_with_context(conv_msgs)
+
+    app.logger.info(
+        f"✅ Chat answered (mode={mode}, citations={len(citations)})")
+    return jsonify({"answer": answer, "mode": mode, "citations": citations, "chunks_used": len(docs)})
+
+
+# -------------------------------------------------------------------
+# Paper Processing: Summaries & Extraction
+# -------------------------------------------------------------------
+
+
+@app.route("/summarize/<int:pub_id>", methods=["POST"])
+def summarize(pub_id: int):
+    app.logger.info(f"📄 Summarize requested for pub_id={pub_id}")
+    db: Session = SessionLocal()
+    try:
+        p = db.get(Publication, pub_id)
+        if not p:
+            # fmt: off
+            app.logger.warning(f"❌ Summarize failed: pub_id {pub_id} not found")
+            return jsonify({"error": "not found"}), 404
+
+        # Cache check
+        if p.summary:
+            app.logger.info(f"✅ Summarize cache hit for pub_id {pub_id}")
+            return jsonify({"id": p.id, "title": p.title, "summary": p.summary})
+
+        # Collect sections
+        secs = db.query(Section).filter(Section.publication_id == p.id).all()
+        abs_sec = next((s for s in secs if s.kind ==
+                       SectionType.abstract), None)
+        res_sec = next((s for s in secs if s.kind ==
+                       SectionType.results), None)
+
+        abstract = abs_sec.text if abs_sec else ""
+        results_txt = res_sec.text if res_sec else ""
+
+        # Fallback if empty
+        if not abstract and not results_txt:
+            # fmt: off
+            app.logger.warning(f"Summarize: pub_id {pub_id} has no abstract/results, using full text")
+            full_text = " ".join(s.text for s in secs if s.text)[:8000]
+            if not full_text.strip():
+                return jsonify({"error": "no content to summarize"}), 400
+            summary = summarize_paper(p.title, full_text, "")
+        else:
+            summary = summarize_paper(p.title, abstract, results_txt)
+
+        # Save back to DB
+        p.summary = summary
+        db.add(p)
+        db.commit()
+
+        app.logger.info(f"✅ Summarize generated & cached for pub_id {pub_id}")
+        return jsonify({"id": p.id, "title": p.title, "summary": summary})
+    finally:
+        db.close()
+
+
+@app.route("/summarize/bulk", methods=["POST"])
+def summarize_bulk():
+    app.logger.info("📄 Bulk summarization started")
+    db: Session = SessionLocal()
+    try:
+        pubs = db.query(Publication).filter(
+            Publication.summary.is_(None)).all()
+        total = len(pubs)
+        done = 0
+
+        for pub in pubs:
+            sections = db.query(Section).filter(
+                Section.publication_id == pub.id).all()
+            abs_text = next(
+                (s.text for s in sections if s.kind == SectionType.abstract), "")
+            res_text = next(
+                (s.text for s in sections if s.kind == SectionType.results), "")
+
+            if not abs_text and not res_text:
+                full_text = " ".join(s.text for s in sections if s.text)[:8000]
+                if not full_text.strip():
+                    continue
+                summary = summarize_paper(pub.title, full_text, "")
+            else:
+                summary = summarize_paper(pub.title, abs_text, res_text)
+
+            if not summary:
+                continue
+
+            pub.summary = summary
+            done += 1
+
+            if done % 5 == 0:
+                db.commit()
+            app.logger.info(f"✅ Summarized {done}/{total} (pub_id={pub.id})")
+
+        db.commit()
+        # fmt: off
+        app.logger.info(f"✅ Bulk summarization finished: {done}/{total} papers summarized")
+        return jsonify({"status": "ok", "summarized": done, "total": total})
+    finally:
+        db.close()
+
+
+@app.route("/extract/<int:pub_id>", methods=["POST"])
+def extract(pub_id: int):
+    app.logger.info(f"🔬 Extraction requested for pub_id={pub_id}")
+    db: Session = SessionLocal()
+    try:
+        pub = db.get(Publication, pub_id)
+        if not pub:
+            return jsonify({"error": "Publication not found"}), 404
+
+        # Collect full text
+        sections = db.query(Section).filter(
+            Section.publication_id == pub.id).all()
+        text = " ".join(s.text for s in sections if s.text)
+        if not text.strip():
+            app.logger.warning(f"⚠️ Skipping pub_id={pub_id}, no text")
+            return jsonify({"status": "skipped", "reason": "no text"})
+
+        # Call LLM
+        raw = extract_entities_triples(text)
+        try:
+            parsed = json.loads(raw)
+        except Exception as e:
+            app.logger.warning(
+                f"⚠️ JSON parse failed for pub_id={pub.id}: {e}")
+            return jsonify({"status": "error", "reason": "bad JSON"})
+
+        # Delete previous entities/triples
+        db.query(Entity).filter(Entity.publication_id == pub.id).delete()
+        db.query(Triple).filter(Triple.publication_id == pub.id).delete()
+
+        # Insert entities
+        entity_count = 0
+        for e in parsed.get("entities", []):
+            if not e.get("text"):
+                continue
+            db.add(Entity(publication_id=pub.id,
+                   text=e["text"].strip(), type=e.get("type")))
+            entity_count += 1
+
+        # Insert triples
+        triple_count = 0
+        for t in parsed.get("triples", []):
+            if not all(k in t for k in ("subject", "relation", "object")):
+                continue
+            db.add(
+                Triple(
+                    publication_id=pub.id,
+                    subject=t["subject"].strip(),
+                    relation=t["relation"].strip(),
+                    object=t["object"].strip(),
+                    evidence_sentence=t.get("evidence_sentence", "")[:500],
+                    confidence=float(t.get("confidence", 0.0)),
+                )
+            )
+            triple_count += 1
+
+        db.commit()
+        app.logger.info(
+            f"✅ Extracted {entity_count} entities and {triple_count} triples for pub_id={pub.id}"
+        )
+
+        return jsonify({"status": "ok", "entities": entity_count, "triples": triple_count})
+    finally:
+        db.close()
+
+
+@app.route("/extract/bulk", methods=["POST"])
+def extract_bulk():
+    app.logger.info("🔬 Bulk extraction started")
+    db: Session = SessionLocal()
+    try:
+        pubs = db.query(Publication).all()
+        total = len(pubs)
+        processed = 0
+
+        for pub in pubs:
+            app.logger.info(f"🔎 Processing pub_id={pub.id}")
+
+            # Always re-extract — remove old data
+            db.query(Entity).filter(Entity.publication_id == pub.id).delete()
+            db.query(Triple).filter(Triple.publication_id == pub.id).delete()
+
+            # Collect full section text
+            sections = db.query(Section).filter(
+                Section.publication_id == pub.id).all()
+            text = " ".join(s.text for s in sections if s.text)
+            if not text.strip():
+                app.logger.warning(f"⚠️ Skipping pub_id={pub.id}, no text")
+                continue
+
+            # Call LLM extractor
+            raw = extract_entities_triples(text)
+            try:
+                parsed = json.loads(raw)
+            except Exception as e:
+                app.logger.warning(
+                    f"⚠️ JSON parse failed for pub_id={pub.id}: {e}")
+                continue
+
+            # Insert entities
+            entity_count = 0
+            for e in parsed.get("entities", []):
+                if not e.get("text"):
+                    continue
+                db.add(Entity(publication_id=pub.id,
+                       text=e["text"].strip(), type=e.get("type")))
+                entity_count += 1
+
+            # Insert triples
+            triple_count = 0
+            for t in parsed.get("triples", []):
+                if not all(k in t for k in ("subject", "relation", "object")):
+                    continue
+                db.add(
+                    Triple(
+                        publication_id=pub.id,
+                        subject=t["subject"].strip(),
+                        relation=t["relation"].strip(),
+                        object=t["object"].strip(),
+                        evidence_sentence=t.get("evidence_sentence", "")[:500],
+                        confidence=float(t.get("confidence", 0.0)),
+                    )
+                )
+                triple_count += 1
+
+            db.commit()
+            processed += 1
+            # fmt: off
+            app.logger.info(
+                f"✅ Extracted {entity_count} entities and {triple_count} triples for pub_id={pub.id} ({processed}/{total})"
+            )
+
+        # fmt: off
+        app.logger.info(f"🏁 Bulk extraction finished: {processed}/{total} publications processed")
+        return jsonify({"status": "ok", "processed": processed, "total": total})
+
+    finally:
+        db.close()
+
+@app.route("/research/test", methods=["GET"])
+def research_test():
+    """
+    Test endpoint for deep research functionality.
+    """
+    return jsonify({
+        "status": "ok",
+        "message": "Deep research backend is working",
+        "timestamp": str(datetime.now())
+    })
+
+@app.route("/research/analyze", methods=["POST"])
+def research_analyze():
+    """
+    Deep originality analysis for research papers with feedback per section.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        title = data.get("title", "Untitled Research")
+        sections = data.get("sections", {})
+
+        app.logger.info(f"🔬 Deep Research: Starting analysis for '{title}'")
+        app.logger.info(f"🔬 Deep Research: Sections provided: {list(sections.keys())}")
+
+        if not sections:
+            app.logger.warning("🔬 Deep Research: No sections provided")
+            return jsonify({"error": "No sections provided"}), 400
+
+        app.logger.info(f"🔬 Deep Research: Calling analyze_research_paper...")
+        result = analyze_research_paper(title, sections)
+        app.logger.info(f"🔬 Deep Research: Analysis complete for '{title}'")
+        app.logger.info(f"🔬 Deep Research: Result keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        app.logger.error(f"🔬 Deep Research: Error in research_analyze: {str(e)}")
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+
+
+# -------------------------------------------------------------------
+# Analytics / Insights
+# -------------------------------------------------------------------
+
+
+@app.route("/insights/<int:pub_id>", methods=["GET"])
+def insights(pub_id: int):
+    app.logger.info(f"🔍 Insights requested for pub_id={pub_id}")
+    db: Session = SessionLocal()
+    try:
+        p = db.get(Publication, pub_id)
+        if not p:
+            app.logger.warning(f"❌ Insights failed: pub_id {pub_id} not found")
+            return jsonify({"error": "not found"}), 404
+
+        # Cache check
+        if getattr(p, "insights", None):
+            app.logger.info(f"✅ Insights cache hit for pub_id={pub_id}")
+            return jsonify({"id": p.id, "title": p.title, "insights": p.insights})
+
+        # Ensure summary exists
+        if not p.summary:
+            secs = db.query(Section).filter(
+                Section.publication_id == p.id).all()
+            full_text = " ".join(s.text for s in secs if s.text)[:8000]
+            if full_text.strip():
+                p.summary = summarize_paper(p.title, full_text, "")
+                db.add(p)
+                db.commit()
+
+        # Get top entities/triples
+        entities = db.query(Entity).filter(
+            Entity.publication_id == p.id).limit(3).all()
+        triples = db.query(Triple).filter(
+            Triple.publication_id == p.id).limit(3).all()
+
+        ctx = f"Title: {p.title}\n\nSummary: {p.summary or ''}\n\n"
+        if entities:
+            ctx += "Entities:\n" + \
+                "\n".join(f"- {e.text} ({e.type})" for e in entities) + "\n\n"
+        if triples:
+            ctx += "Relations:\n" + \
+                "\n".join(
+                    f"- {t.subject} {t.relation} {t.object}" for t in triples) + "\n\n"
+
+        user_prompt = (
+            "Provide deep insights about this study, including biological significance, "
+            "potential applications, and unanswered questions. Be concise but precise.\n\n"
+            f"{ctx}"
+        )
+
+        conv_msgs = [
+            {"role": "system",
+                "content": "You are a space biology expert providing insights."},
+            {"role": "user", "content": user_prompt},
+        ]
+        insights_text = chat_with_context(conv_msgs)
+
+        # Cache insights
+        p.insights = insights_text
+        db.add(p)
+        db.commit()
+
+        app.logger.info(f"✅ Insights generated & cached for pub_id={pub_id}")
+        return jsonify({"id": p.id, "title": p.title, "insights": insights_text})
+    finally:
+        db.close()
+
+
+@app.route("/trends", methods=["GET"])
+def trends():
+    app.logger.info("📈 Trends endpoint requested")
+
+    # Compute trends
+    entity_trends = compute_entity_trends()
+    relation_trends = compute_relation_trends()
+
+    # Top normalized items
+    top_entities = compute_top_trends(entity_trends, 10, label="entities")
+    top_relations = compute_top_trends(relation_trends, 5, label="relations")
+
+    # Build context for AI
+    ctx_text = f"Entity Trends:\n{json.dumps(top_entities, indent=2)}\n\nRelation Trends:\n{json.dumps(top_relations, indent=2)}"
+
+    conv_msgs = [
+        {
+            "role": "system",
+            "content": "You are a space biology expert. Summarize these trends into a concise narrative highlighting biological significance and research directions.",
+        },
+        {"role": "user", "content": ctx_text},
+    ]
+    insights = chat_with_context(conv_msgs)
+
+    # fmt: off
+    app.logger.info(
+        f"✅ Trends computed: {len(top_entities)} years of entity data, {len(top_relations)} years of relation data"
+    )
+    return jsonify(
+        {
+            "entity_trends": top_entities,
+            "relation_trends": top_relations,
+            "insights": insights,
+        }
+    )
+
+
+@app.route("/gaps", methods=["GET"])
+def gaps():
+    app.logger.info("🕳️ Gaps detection started")
+    from trends import compute_gaps
+
+    db: Session = SessionLocal()
+    try:
+        # Parameters
+        min_threshold = int(request.args.get("min_threshold", 5))
+        relative = float(request.args.get("relative", 0.2))
+
+        gaps = compute_gaps(min_threshold=min_threshold, relative=relative)
+
+        if not gaps:
+            app.logger.info("✅ No gaps detected")
+            return jsonify({"gaps": [], "insights": "No gaps detected."})
+
+        # Collect representative examples
+        gap_examples = []
+        for g in gaps[:10]:
+            entity = g["name"]  # changed from "term" to "name"
+            pubs = (
+                db.query(Publication)
+                .join(Entity, Entity.publication_id == Publication.id)
+                .filter(Entity.text.ilike(entity))
+                .limit(3)
+                .all()
+            )
+            for pub in pubs:
+                if pub.summary:
+                    gap_examples.append(
+                        {
+                            "entity": entity,
+                            "pub_id": pub.id,
+                            "title": pub.title,
+                            "summary": pub.summary[:800],
+                        }
+                    )
+
+        # Build context for AI insights
+        ctx_text = "\n\n".join(
+            f"Entity: {ex['entity']}\nPaper: {ex['title']}\nSummary: {ex['summary']}" for ex in gap_examples
+        )
+        user_prompt = (
+            "Based on these low-coverage research areas, identify the main gaps "
+            "and suggest promising directions for future experiments.\n\n"
+            f"{ctx_text}"
+        )
+
+        conv_msgs = [
+            {"role": "system", "content": "You are a space biology expert. Be precise and concise."},
+            {"role": "user", "content": user_prompt},
+        ]
+        insights = chat_with_context(conv_msgs)
+
+        app.logger.info(f"✅ Gaps detection finished: {len(gaps)} gaps found")
+        return jsonify({"gaps": gaps, "examples": gap_examples, "insights": insights})
+    finally:
+        db.close()
+
+
+# -------------------------------------------------------------------
+# Education Tab Endpoints
+# -------------------------------------------------------------------
+
+
+@app.route("/education/generate", methods=["POST"])
+def education_generate():
+    app.logger.info("📚 Education: Generating lessons for all topics")
+    
+    try:
+        results = generate_lessons_for_all_topics()
+        app.logger.info(f"📚 Education: Generated {len(results)} lessons")
+        
+        # Log details about generated lessons
+        for i, result in enumerate(results[:3]):  # Log first 3 results
+            app.logger.info(f"📚 Education: Generated lesson {i+1} - {result}")
+        
+        return jsonify({"status": "ok", "lessons_created": len(results)})
+        
+    except Exception as e:
+        app.logger.error(f"📚 Education: Error generating lessons: {str(e)}")
+        return jsonify({"error": "Failed to generate lessons", "details": str(e)}), 500
+
+
+@app.route("/education/lessons", methods=["GET"])
+def list_lessons():
+    app.logger.info("📚 Education: Getting all lessons")
+    
+    with SessionLocal() as db:
+        try:
+            lessons = db.query(Lesson).all()
+            app.logger.info(f"📚 Education: Found {len(lessons)} lessons in database")
+            
+            if not lessons:
+                app.logger.warning("📚 Education: No lessons found in database")
+                return jsonify([])
+            
+            # Log first lesson details for debugging
+            if lessons:
+                first_lesson = lessons[0]
+                app.logger.info(f"📚 Education: First lesson - ID: {first_lesson.id}, Topic: {first_lesson.topic}, Title: {first_lesson.title}, Level: {first_lesson.level}")
+                app.logger.info(f"📚 Education: First lesson content length: {len(first_lesson.content) if first_lesson.content else 0}")
+            
+            result = [
+                {
+                    "id": l.id,
+                    "topic": l.topic,
+                    "title": l.title,
+                    "level": l.level,
+                    "difficulty_score": l.difficulty_score,
+                    "content": l.content,
+                }
+                for l in lessons
+            ]
+            
+            app.logger.info(f"📚 Education: Returning {len(result)} lessons to frontend")
+            return jsonify(result)
+            
+        except Exception as e:
+            app.logger.error(f"📚 Education: Error getting lessons: {str(e)}")
+            return jsonify({"error": "Failed to get lessons", "details": str(e)}), 500
+
+
+@app.route("/education/lessons/<int:lesson_id>", methods=["GET"])
+def get_lesson(lesson_id):
+    app.logger.info(f"📚 Education: Getting lesson with ID {lesson_id}")
+    
+    with SessionLocal() as db:
+        try:
+            lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+            
+            if not lesson:
+                app.logger.warning(f"📚 Education: Lesson with ID {lesson_id} not found")
+                return jsonify({"error": "Lesson not found"}), 404
+            
+            app.logger.info(f"📚 Education: Found lesson - ID: {lesson.id}, Topic: {lesson.topic}, Title: {lesson.title}, Level: {lesson.level}")
+            app.logger.info(f"📚 Education: Lesson content length: {len(lesson.content) if lesson.content else 0}")
+            
+            result = {
+                "id": lesson.id,
+                "topic": lesson.topic,
+                "title": lesson.title,
+                "level": lesson.level,
+                "difficulty_score": lesson.difficulty_score,
+                "content": lesson.content,
+            }
+            
+            app.logger.info(f"📚 Education: Returning lesson {lesson_id} to frontend")
+            return jsonify(result)
+            
+        except Exception as e:
+            app.logger.error(f"📚 Education: Error getting lesson {lesson_id}: {str(e)}")
+            return jsonify({"error": "Failed to get lesson", "details": str(e)}), 500
+
+
+@app.route("/education/lessons/<int:lesson_id>/questions", methods=["GET"])
+def get_questions(lesson_id):
+    from models import Question
+    
+    app.logger.info(f"📚 Education: Getting questions for lesson {lesson_id}")
+
+    db = SessionLocal()
+    try:
+        qs = db.query(Question).filter(Question.lesson_id == lesson_id).all()
+        app.logger.info(f"📚 Education: Found {len(qs)} questions for lesson {lesson_id}")
+        
+        if not qs:
+            app.logger.warning(f"📚 Education: No questions found for lesson {lesson_id}")
+            return jsonify([])
+        
+        # Log first question details for debugging
+        if qs:
+            first_q = qs[0]
+            app.logger.info(f"📚 Education: First question - ID: {first_q.id}, Text: {first_q.text[:50]}..., Answer: {first_q.answer}")
+        
+        result = [
+            {
+                "id": q.id,
+                "text": q.text,
+                "choices": json.loads(q.choices) if isinstance(q.choices, str) else q.choices,
+                "answer": q.answer,
+                "difficulty": q.difficulty,
+            }
+            for q in qs
+        ]
+        
+        app.logger.info(f"📚 Education: Returning {len(result)} questions for lesson {lesson_id}")
+        return jsonify(result)
+        
+    except Exception as e:
+        app.logger.error(f"📚 Education: Error getting questions for lesson {lesson_id}: {str(e)}")
+        return jsonify({"error": "Failed to get questions", "details": str(e)}), 500
+    finally:
+        db.close()
+
+
+
+@app.route("/education/generate_questions", methods=["POST"])
+def generate_questions():
+    app.logger.info("📚 Education: Generating questions for lessons")
+    
+    try:
+        created = generate_questions_for_lessons()
+        app.logger.info(f"📚 Education: Generated {created} questions")
+        return jsonify({"status": "success", "created": created})
+        
+    except Exception as e:
+        app.logger.error(f"📚 Education: Error generating questions: {str(e)}")
+        return jsonify({"error": "Failed to generate questions", "details": str(e)}), 500
+
+
+# -------------------------------------------------------------------
+# Knowledge Graph Endpoints
+# -------------------------------------------------------------------
+
+@app.route("/graph/entities", methods=["GET"])
+def get_graph_entities():
+    app.logger.info("🕸️ Graph: Getting all entities")
+    
+    with SessionLocal() as db:
+        try:
+            entities = db.query(Entity).all()
+            app.logger.info(f"🕸️ Graph: Found {len(entities)} entities in database")
+            
+            if not entities:
+                app.logger.warning("🕸️ Graph: No entities found in database")
+                return jsonify([])
+            
+            # Log first entity details for debugging
+            if entities:
+                first_entity = entities[0]
+                app.logger.info(f"🕸️ Graph: First entity - ID: {first_entity.id}, Text: {first_entity.text}, Type: {first_entity.type}")
+            
+            result = [
+                {
+                    "id": e.id,
+                    "text": e.text,
+                    "type": e.type,
+                    "publication_id": e.publication_id,
+                }
+                for e in entities
+            ]
+            
+            app.logger.info(f"🕸️ Graph: Returning {len(result)} entities to frontend")
+            return jsonify(result)
+            
+        except Exception as e:
+            app.logger.error(f"🕸️ Graph: Error getting entities: {str(e)}")
+            return jsonify({"error": "Failed to get entities", "details": str(e)}), 500
+
+
+@app.route("/graph/triples", methods=["GET"])
+def get_graph_triples():
+    app.logger.info("🕸️ Graph: Getting all triples")
+    
+    with SessionLocal() as db:
+        try:
+            triples = db.query(Triple).all()
+            app.logger.info(f"🕸️ Graph: Found {len(triples)} triples in database")
+            
+            if not triples:
+                app.logger.warning("🕸️ Graph: No triples found in database")
+                return jsonify([])
+            
+            # Log first triple details for debugging
+            if triples:
+                first_triple = triples[0]
+                app.logger.info(f"🕸️ Graph: First triple - ID: {first_triple.id}, Subject: {first_triple.subject}, Relation: {first_triple.relation}, Object: {first_triple.object}")
+            
+            result = [
+                {
+                    "id": t.id,
+                    "subject": t.subject,
+                    "relation": t.relation,
+                    "object": t.object,
+                    "publication_id": t.publication_id,
+                }
+                for t in triples
+            ]
+            
+            app.logger.info(f"🕸️ Graph: Returning {len(result)} triples to frontend")
+            return jsonify(result)
+            
+        except Exception as e:
+            app.logger.error(f"🕸️ Graph: Error getting triples: {str(e)}")
+            return jsonify({"error": "Failed to get triples", "details": str(e)}), 500
+
+
+@app.route("/graph/stats", methods=["GET"])
+def get_graph_stats():
+    app.logger.info("🕸️ Graph: Getting graph statistics")
+    
+    with SessionLocal() as db:
+        try:
+            entity_count = db.query(Entity).count()
+            triple_count = db.query(Triple).count()
+            publication_count = db.query(Publication).count()
+            
+            app.logger.info(f"🕸️ Graph: Stats - Entities: {entity_count}, Triples: {triple_count}, Publications: {publication_count}")
+            
+            result = {
+                "entities": entity_count,
+                "triples": triple_count,
+                "publications": publication_count,
+                "nodes": entity_count + publication_count,  # Total nodes in graph
+                "edges": triple_count,  # Total edges in graph
+            }
+            
+            app.logger.info(f"🕸️ Graph: Returning stats to frontend")
+            return jsonify(result)
+            
+        except Exception as e:
+            app.logger.error(f"🕸️ Graph: Error getting stats: {str(e)}")
+            return jsonify({"error": "Failed to get graph stats", "details": str(e)}), 500
+
+
+# -------------------------------------------------------------------
+# Entrypoint
+# -------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app.run(debug=(Config.FLASK_ENV != "production"), port=Config.PORT)

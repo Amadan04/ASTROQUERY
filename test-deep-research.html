@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Deep Research</title>
+</head>
+<body>
+    <h1>Test Deep Research Backend</h1>
+    <button id="testBtn">Test Deep Research</button>
+    <button id="testSimpleBtn">Test Simple Endpoint</button>
+    <div id="result"></div>
+
+    <script>
+        // Test simple endpoint first
+        document.getElementById('testSimpleBtn').addEventListener('click', async () => {
+            const resultDiv = document.getElementById('result');
+            resultDiv.innerHTML = 'Testing simple endpoint...';
+            
+            try {
+                const response = await fetch('http://localhost:5000/research/test');
+                const data = await response.json();
+                resultDiv.innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+            } catch (error) {
+                resultDiv.innerHTML = 'Simple test error: ' + error.message;
+            }
+        });
+
+        // Test full analysis
+        document.getElementById('testBtn').addEventListener('click', async () => {
+            const resultDiv = document.getElementById('result');
+            resultDiv.innerHTML = 'Testing full analysis...';
+            
+            try {
+                const response = await fetch('http://localhost:5000/research/analyze', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        title: 'Test Paper',
+                        sections: {
+                            abstract: 'This is a test abstract for deep research analysis.',
+                            methods: 'This is a test methods section.',
+                            results: 'This is a test results section.',
+                            discussion: 'This is a test discussion section.'
+                        }
+                    })
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    resultDiv.innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                } else {
+                    resultDiv.innerHTML = 'Error: ' + response.status + ' ' + response.statusText;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = 'Error: ' + error.message;
+            }
+        });
+    </script>
+</body>
+</html>

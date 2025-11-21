@@ -1,0 +1,40 @@
+{
+  "name": "astroquery-nasa-dashboard",
+  "version": "1.0.0",
+  "description": "AI-powered NASA space biology research dashboard with semantic search and knowledge graph visualization",
+  "type": "module",
+  "private": false,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [
+    "nasa",
+    "space-biology",
+    "research",
+    "ai",
+    "semantic-search",
+    "knowledge-graph",
+    "machine-learning",
+    "education",
+    "visualization"
+  ],
+  "author": "Abdulla Madan <abdullajurdabii@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Amadan04/NASA-dashboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Amadan04/NASA-dashboard/issues"
+  },
+  "homepage": "https://github.com/Amadan04/NASA-dashboard#readme",
+  "devDependencies": {
+    "vite": "^5.4.2"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  }
+}

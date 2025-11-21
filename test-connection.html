@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backend Connection Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #0a1426;
+            color: #dce9ff;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #1e2b54;
+            border-radius: 8px;
+            background: #0c152a;
+        }
+        .success { color: #00eaff; }
+        .error { color: #ff6b6b; }
+        .loading { color: #9cb9dd; }
+        button {
+            background: #00eaff;
+            color: #0a1426;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #59d0ff;
+        }
+        pre {
+            background: #0f1b34;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>Backend Connection Test</h1>
+    <p>This page tests the connection to the Flask backend running on localhost:5000</p>
+    
+    <div class="test-section">
+        <h2>Health Check</h2>
+        <button onclick="testHealth()">Test Health Endpoint</button>
+        <div id="health-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Stats</h2>
+        <button onclick="testStats()">Get Database Stats</button>
+        <div id="stats-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Publications</h2>
+        <button onclick="testPublications()">Get Publications</button>
+        <div id="publications-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Semantic Search</h2>
+        <button onclick="testSemanticSearch()">Test Semantic Search</button>
+        <div id="semantic-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Chat</h2>
+        <button onclick="testChat()">Test Chat</button>
+        <div id="chat-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Education Endpoints</h2>
+        <button onclick="testEducation()">Test Education API</button>
+        <div id="education-result"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:5000';
+        
+        async function testHealth() {
+            const result = document.getElementById('health-result');
+            result.innerHTML = '<div class="loading">Testing...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const data = await response.json();
+                result.innerHTML = `<div class="success">✅ Health check passed</div><pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                result.innerHTML = `<div class="error">❌ Health check failed: ${error.message}</div>`;
+            }
+        }
+        
+        async function testStats() {
+            const result = document.getElementById('stats-result');
+            result.innerHTML = '<div class="loading">Testing...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/stats`);
+                const data = await response.json();
+                result.innerHTML = `<div class="success">✅ Stats retrieved</div><pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                result.innerHTML = `<div class="error">❌ Stats failed: ${error.message}</div>`;
+            }
+        }
+        
+        async function testPublications() {
+            const result = document.getElementById('publications-result');
+            result.innerHTML = '<div class="loading">Testing...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/publications?page=1&per_page=5`);
+                const data = await response.json();
+                result.innerHTML = `<div class="success">✅ Publications retrieved (${data.items.length} items)</div><pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                result.innerHTML = `<div class="error">❌ Publications failed: ${error.message}</div>`;
+            }
+        }
+        
+        async function testSemanticSearch() {
+            const result = document.getElementById('semantic-result');
+            result.innerHTML = '<div class="loading">Testing...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/semantic-search?q=space biology&k=3`);
+                const data = await response.json();
+                result.innerHTML = `<div class="success">✅ Semantic search completed (${data.results.length} results)</div><pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                result.innerHTML = `<div class="error">❌ Semantic search failed: ${error.message}</div>`;
+            }
+        }
+        
+        async function testChat() {
+            const result = document.getElementById('chat-result');
+            result.innerHTML = '<div class="loading">Testing...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/chat`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        messages: [{ role: 'user', content: 'What is space biology?' }],
+                        k: 3
+                    })
+                });
+                const data = await response.json();
+                result.innerHTML = `<div class="success">✅ Chat completed</div><pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                result.innerHTML = `<div class="error">❌ Chat failed: ${error.message}</div>`;
+            }
+        }
+        
+        async function testEducation() {
+            const result = document.getElementById('education-result');
+            result.innerHTML = '<div class="loading">Testing...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/education/lessons`);
+                const data = await response.json();
+                result.innerHTML = `<div class="success">✅ Education API working (${data.length} lessons)</div><pre>${JSON.stringify(data, null, 2)}</pre>`;
+            } catch (error) {
+                result.innerHTML = `<div class="error">❌ Education API failed: ${error.message}</div>`;
+            }
+        }
+        
+        // Auto-run health check on page load
+        window.addEventListener('load', testHealth);
+    </script>
+</body>
+</html>

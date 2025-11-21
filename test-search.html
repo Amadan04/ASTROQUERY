@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Search Test - NASA Space Biology Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #0a1426;
+            color: #dce9ff;
+        }
+        .search-container {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #1e2b54;
+            border-radius: 8px;
+            background: #0c152a;
+        }
+        .search-input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #1e2b54;
+            border-radius: 6px;
+            background: #0f1b34;
+            color: #dce9ff;
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+        .search-button {
+            background: #00eaff;
+            color: #0a1426;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .search-button:hover {
+            background: #59d0ff;
+        }
+        .results {
+            margin-top: 20px;
+        }
+        .result-card {
+            background: #0f1b34;
+            border: 1px solid #1e2b54;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .result-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #dce9ff;
+        }
+        .result-meta {
+            color: #9cb9dd;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        .result-sections {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+        .section-tag {
+            background: #1e2b54;
+            color: #9cb9dd;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .distance-badge {
+            background: #1e2b54;
+            color: #9cb9dd;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #9cb9dd;
+        }
+        .error {
+            color: #ff6b6b;
+            padding: 20px;
+            background: rgba(255, 107, 107, 0.1);
+            border: 1px solid rgba(255, 107, 107, 0.3);
+            border-radius: 6px;
+        }
+        .success {
+            color: #00eaff;
+        }
+    </style>
+</head>
+<body>
+    <h1>Search Test - NASA Space Biology Dashboard</h1>
+    <p>Test the search functionality with the real backend</p>
+    
+    <div class="search-container">
+        <h2>Search Publications</h2>
+        <input type="text" id="searchInput" class="search-input" placeholder="Enter search query (e.g., 'space biology', 'microgravity', 'immune cells')" />
+        <button onclick="performSearch()" class="search-button">Search</button>
+        
+        <div id="searchResults" class="results"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:5000';
+        
+        async function performSearch() {
+            const query = document.getElementById('searchInput').value.trim();
+            const resultsDiv = document.getElementById('searchResults');
+            
+            if (!query) {
+                resultsDiv.innerHTML = '<div class="error">Please enter a search query</div>';
+                return;
+            }
+            
+            resultsDiv.innerHTML = '<div class="loading">Searching...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/semantic-search?q=${encodeURIComponent(query)}&k=10&suggestions=true`);
+                
+                if (!response.ok) {
+                    throw new Error(`Search failed: ${response.status} ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                if (data.results && data.results.length > 0) {
+                    resultsDiv.innerHTML = `
+                        <div class="success">✅ Found ${data.results.length} results</div>
+                        ${data.results.map(result => `
+                            <div class="result-card">
+                                <div class="result-title">
+                                    <a href="${result.link}" target="_blank" rel="noopener noreferrer">${result.title}</a>
+                                    ${result.distance !== undefined ? `<span class="distance-badge">${result.distance.toFixed(3)}</span>` : ''}
+                                </div>
+                                <div class="result-meta">${result.journal || 'Unknown Journal'} • ${result.year}</div>
+                                ${result.sections && result.sections.length > 0 ? `
+                                    <div class="result-sections">
+                                        ${result.sections.map(section => `<span class="section-tag">${section}</span>`).join('')}
+                                    </div>
+                                ` : ''}
+                            </div>
+                        `).join('')}
+                    `;
+                } else {
+                    resultsDiv.innerHTML = '<div class="error">No results found</div>';
+                }
+                
+                if (data.suggestions && data.suggestions.length > 0) {
+                    resultsDiv.innerHTML += `
+                        <div style="margin-top: 20px; padding: 16px; background: #0f1b34; border-radius: 8px;">
+                            <h3 style="margin-bottom: 12px; color: #dce9ff;">Suggested Queries:</h3>
+                            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                                ${data.suggestions.map(suggestion => `
+                                    <button onclick="searchSuggestion('${suggestion}')" style="background: #1e2b54; color: #dce9ff; border: 1px solid #1e2b54; border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 12px;">${suggestion}</button>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+                
+            } catch (error) {
+                resultsDiv.innerHTML = `<div class="error">❌ Search failed: ${error.message}</div>`;
+            }
+        }
+        
+        function searchSuggestion(suggestion) {
+            document.getElementById('searchInput').value = suggestion;
+            performSearch();
+        }
+        
+        // Allow Enter key to search
+        document.getElementById('searchInput').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                performSearch();
+            }
+        });
+    </script>
+</body>
+</html>
