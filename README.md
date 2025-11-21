@@ -86,7 +86,7 @@ cd NASA-dashboard
 
 ```bash
 # Navigate to backend directory
-cd nasa-dashboard-backend-master
+cd backend
 
 # Create Python virtual environment
 python -m venv venv
@@ -127,7 +127,7 @@ npm install
 
 ### Environment Variables
 
-Create a `.env` file in the **`nasa-dashboard-backend-master`** directory with the following:
+Create a `.env` file in the **`backend`** directory with the following:
 
 ```bash
 # Flask Configuration
@@ -162,7 +162,7 @@ You need to run both the backend and frontend simultaneously.
 #### Terminal 1: Start Backend
 
 ```bash
-cd nasa-dashboard-backend-master
+cd backend
 
 # Activate virtual environment
 # On Windows:
@@ -193,7 +193,7 @@ Open your browser and navigate to the URL shown in the terminal.
 
 ```
 NASA-dashboard/
-├── nasa-dashboard-backend-master/   # Backend (Python Flask)
+├── backend/                          # Backend (Python Flask)
 │   ├── app.py                        # Main Flask application
 │   ├── config.py                     # Configuration loader
 │   ├── models.py                     # Database models
@@ -213,13 +213,28 @@ NASA-dashboard/
 │   │   └── nlp_clean.py
 │   └── migrations/                   # Database migrations
 │
+├── frontend/                         # Frontend application
+│   ├── src/                          # Source files
+│   │   ├── *.js                      # JavaScript modules
+│   │   └── *.css                     # Stylesheets
+│   └── public/                       # Static assets
+│       └── assets/                   # Images, icons
+│
+├── docs/                             # Documentation
+│   ├── QUICK_START_GUIDE.md         # Quick setup guide
+│   ├── PRE_PUBLICATION_CHECKLIST.md # Detailed checklist
+│   ├── CHANGES_SUMMARY.md           # Change log
+│   └── FINAL_ACTIONS_REQUIRED.md    # Action items
+│
 ├── index.html                        # Main HTML entry point
-├── app.js                            # Main app router
-├── styles.css                        # Global styles
 ├── package.json                      # Node.js dependencies
 ├── .env.example                      # Frontend env template
 ├── .gitignore                        # Git ignore rules
-└── README.md                         # This file
+├── README.md                         # This file
+├── LICENSE                           # MIT License
+├── SECURITY.md                       # Security policy
+├── setup.bat                         # Windows setup script
+└── setup.sh                          # Linux/Mac setup script
 ```
 
 ---

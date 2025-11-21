@@ -33,7 +33,7 @@ echo ""
 
 # Backend setup
 echo "[3/6] Setting up Python backend..."
-cd nasa-dashboard-backend-master
+cd backend
 
 # Create virtual environment
 if [ ! -d "venv" ]; then
@@ -62,7 +62,7 @@ if [ ! -f ".env" ]; then
     echo " IMPORTANT: Configure API Keys"
     echo "================================"
     echo ""
-    echo "Please edit nasa-dashboard-backend-master/.env and add:"
+    echo "Please edit backend/.env and add:"
     echo "  - OPENROUTER_API_KEY (get from https://openrouter.ai)"
     echo "  - NCBI_API_KEY (get from https://www.ncbi.nlm.nih.gov/account/)"
     echo ""
@@ -81,7 +81,7 @@ echo ""
 
 # Create data directories
 echo "[5/6] Creating data directories..."
-cd nasa-dashboard-backend-master
+cd backend
 mkdir -p data
 cd ..
 echo "[OK] Data directories created"
@@ -95,10 +95,10 @@ echo "================================"
 echo ""
 echo "Next steps:"
 echo ""
-echo "1. Edit nasa-dashboard-backend-master/.env and add your API keys"
+echo "1. Edit backend/.env and add your API keys"
 echo ""
 echo "2. Start the backend (in one terminal):"
-echo "   cd nasa-dashboard-backend-master"
+echo "   cd backend"
 echo "   source venv/bin/activate"
 echo "   python app.py"
 echo ""
